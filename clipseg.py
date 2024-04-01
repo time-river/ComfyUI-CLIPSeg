@@ -9,7 +9,6 @@ from torchvision.transforms.functional import to_pil_image
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
-
 import cv2
 
 from scipy.ndimage import gaussian_filter
@@ -20,6 +19,7 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 warnings.filterwarnings("ignore", category=UserWarning, module="safetensors")
 
+import comfy.utils
 
 
 """Helper methods for CLIPSeg nodes"""
@@ -29,10 +29,10 @@ def tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
     array = tensor.numpy().squeeze()
     return (array * 255).astype(np.uint8)
 
-def numpy_to_tensor(array: np.ndarray) -> torch.Tensor:
+def numpy_to_tensor(array: np.ndarray, dtype) -> torch.Tensor:
     """Convert a numpy array to a tensor and scale its values from 0-255 to 0-1."""
     array = array.astype(np.float32) / 255.0
-    return torch.from_numpy(array)[None,]
+    return torch.from_numpy(array).type(dtype)[None,]
 
 def apply_colormap(mask: torch.Tensor, colormap) -> np.ndarray:
     """Apply a colormap to a tensor and convert it to a numpy array."""
@@ -47,19 +47,44 @@ def overlay_image(background: np.ndarray, foreground: np.ndarray, alpha: float) 
     """Overlay the foreground image onto the background with a given opacity (alpha)."""
     return cv2.addWeighted(background, 1 - alpha, foreground, alpha, 0)
 
-def dilate_mask(mask: torch.Tensor, dilation_factor: float) -> torch.Tensor:
+def dilate_mask(mask: torch.Tensor, dilation_factor: float, dtype) -> torch.Tensor:
     """Dilate a mask using a square kernel with a given dilation factor."""
     kernel_size = int(dilation_factor * 2) + 1
     kernel = np.ones((kernel_size, kernel_size), np.uint8)
     mask_dilated = cv2.dilate(mask.numpy(), kernel, iterations=1)
-    return torch.from_numpy(mask_dilated)
+    return torch.from_numpy(mask_dilated).type(dtype)
 
+def get_heatmap(mask_dilated, image, dtype):
+    # Convert the mask to a heatmap
+    heatmap = apply_colormap(mask_dilated, cm.viridis)
 
+    # Overlay the heatmap on the original image
+    dimensions = (image.shape[1], image.shape[0])
+    heatmap_resized = resize_image(heatmap, dimensions)
+
+    overlay_heatmap = overlay_image(image, heatmap_resized, 0.5)
+
+    # Convert the numpy arrays to tensors
+    return numpy_to_tensor(overlay_heatmap, dtype)
+
+def get_binary(mask_dilated, image, dtype):
+    # Convert the mask to a binary mask
+    binary_mask = apply_colormap(mask_dilated, cm.Greys_r)
+
+    # Overlay the binary mask on the original image
+    dimensions = (image.shape[1], image.shape[0])
+    binary_mask_resized = resize_image(binary_mask, dimensions)
+
+    overlay_binary = overlay_image(image, binary_mask_resized, 1)
+
+    # Convert the numpy arrays to tensors
+    return numpy_to_tensor(overlay_binary, dtype), binary_mask_resized
 
 class CLIPSeg:
 
     def __init__(self):
-        pass
+        self.dtype = torch.float16 if comfy.model_management.should_use_fp16() else torch.float32
+        self.device = comfy.model_management.get_torch_device()
 
     @classmethod
     def INPUT_TYPES(s):
@@ -80,7 +105,7 @@ class CLIPSeg:
         return {"required":
                     {
                         "image": ("IMAGE",),
-                        "text": ("STRING", {"multiline": False}),
+                        "prompt": ("STRING", {"multiline": False}),
                      },
                 "optional":
                     {
@@ -95,12 +120,12 @@ class CLIPSeg:
     RETURN_NAMES = ("Mask","Heatmap Mask", "BW Mask")
 
     FUNCTION = "segment_image"
-    def segment_image(self, image: torch.Tensor, text: str, blur: float, threshold: float, dilation_factor: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def segment_image(self, image: torch.Tensor, prompt: str, blur: float, threshold: float, dilation_factor: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Create a segmentation mask from an image and a text prompt using CLIPSeg.
 
         Args:
             image (torch.Tensor): The image to segment.
-            text (str): The text prompt to use for segmentation.
+            prompt (str): The text prompt to use for segmentation.
             blur (float): How much to blur the segmentation mask.
             threshold (float): The threshold to use for binarizing the segmentation mask.
             dilation_factor (int): How much to dilate the segmentation mask.
@@ -109,56 +134,12 @@ class CLIPSeg:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: The segmentation mask, the heatmap mask, and the binarized mask.
         """
 
-        # Convert the Tensor to a PIL image
-        image_np = tensor_to_numpy(image)
-        # Create a PIL image from the numpy array
-        i = Image.fromarray(image_np, mode="RGB")
+        pil_image = to_pil_image(image, mode="RGB")
+        flat = self.do_clipseg(prompt, [pil_image])
+        mask_dilated = self.get_mask_dilated(flat, threshold, blur, dilation_factor)
 
-        processor = CLIPSegProcessor.from_pretrained("./clipseg-rd64-refined")
-        model = CLIPSegForImageSegmentation.from_pretrained("./clipseg-rd64-refined").to(self.device)
-
-        prompt = text
-        input_prc = processor(text=prompt, images=[i], return_tensors="pt")
-
-        # Predict the segemntation mask
-        with torch.no_grad():
-            outputs = model(**input_prc)
-
-        # see https://huggingface.co/blog/clipseg-zero-shot
-        preds = outputs.logits.unsqueeze(1)
-        tensor = torch.sigmoid(preds[0][0]) # get the mask
-
-        # Apply a threshold to the original tensor to cut off low values
-        thresh = threshold
-        tensor_thresholded = torch.where(tensor > thresh, tensor, torch.tensor(0, dtype=torch.float))
-
-        # Apply Gaussian blur to the thresholded tensor
-        sigma = blur
-        tensor_smoothed = gaussian_filter(tensor_thresholded.numpy(), sigma=sigma)
-        tensor_smoothed = torch.from_numpy(tensor_smoothed)
-
-        # Normalize the smoothed tensor to [0, 1]
-        mask_normalized = (tensor_smoothed - tensor_smoothed.min()) / (tensor_smoothed.max() - tensor_smoothed.min())
-
-        # Dilate the normalized mask
-        mask_dilated = dilate_mask(mask_normalized, dilation_factor)
-
-        # Convert the mask to a heatmap and a binary mask
-        heatmap = apply_colormap(mask_dilated, cm.viridis)
-        binary_mask = apply_colormap(mask_dilated, cm.Greys_r)
-
-        # Overlay the heatmap and binary mask on the original image
-        dimensions = (image_np.shape[1], image_np.shape[0])
-        heatmap_resized = resize_image(heatmap, dimensions)
-        binary_mask_resized = resize_image(binary_mask, dimensions)
-
-        alpha_heatmap, alpha_binary = 0.5, 1
-        overlay_heatmap = overlay_image(image_np, heatmap_resized, alpha_heatmap)
-        overlay_binary = overlay_image(image_np, binary_mask_resized, alpha_binary)
-
-        # Convert the numpy arrays to tensors
-        image_out_heatmap = numpy_to_tensor(overlay_heatmap)
-        image_out_binary = numpy_to_tensor(overlay_binary)
+        image_out_heatmap = get_heatmap(mask_dilated, pil_image)
+        image_out_binary, binary_mask_resized = get_binary(mask_dilated, pil_image, self.dtype)
 
         # Save or display the resulting binary mask
         binary_mask_image = Image.fromarray(binary_mask_resized[..., 0])
@@ -166,12 +147,42 @@ class CLIPSeg:
         # convert PIL image to numpy array
         tensor_bw = binary_mask_image.convert("RGB")
         tensor_bw = np.array(tensor_bw).astype(np.float32) / 255.0
-        tensor_bw = torch.from_numpy(tensor_bw)[None,]
+        tensor_bw = torch.from_numpy(tensor_bw).type(self.dtype)[None,]
         tensor_bw = tensor_bw.squeeze(0)[..., 0]
 
         return tensor_bw, image_out_heatmap, image_out_binary
 
-    #OUTPUT_NODE = False
+    def do_clipseg(self, prompt, images):
+        # see https://huggingface.co/blog/clipseg-zero-shot
+        processor = CLIPSegProcessor.from_pretrained("./clipseg-rd64-refined")
+        model = CLIPSegForImageSegmentation.from_pretrained("./clipseg-rd64-refined").to(self.device)
+
+        inputs = processor(text=prompt, images=images, return_tensors="pt")
+
+        # Predict the segemntation mask
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        preds = outputs.logits
+        return preds[0]
+    
+    def get_mask_dilated(self, flat, threshold, blur, dilation_factor):
+        # get the mask
+        tensor = torch.sigmoid(flat)
+
+        # Apply a threshold to the original tensor to cut off low values
+        tensor_thresholded = torch.where(tensor > threshold, tensor, torch.tensor(0, dtype=self.dtype))
+
+        # Apply Gaussian blur to the thresholded tensor
+        tensor_smoothed = torch.from_numpy(
+            gaussian_filter(tensor_thresholded.numpy(), sigma=blur)
+        ).type(self.dtype)
+
+        # Normalize the smoothed tensor to [0, 1]
+        mask_normalized = (tensor_smoothed - tensor_smoothed.min()) / (tensor_smoothed.max() - tensor_smoothed.min())
+
+        # Dilate the normalized mask
+        return dilate_mask(mask_normalized, dilation_factor)
 
 class CombineMasks:
     def __init__(self):
