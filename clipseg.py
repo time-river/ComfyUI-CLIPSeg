@@ -114,8 +114,8 @@ class CLIPSeg:
         # Create a PIL image from the numpy array
         i = Image.fromarray(image_np, mode="RGB")
 
-        processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
-        model = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined")
+        processor = CLIPSegProcessor.from_pretrained("./clipseg-rd64-refined")
+        model = CLIPSegForImageSegmentation.from_pretrained("./clipseg-rd64-refined").to(self.device)
 
         prompt = text
         input_prc = processor(text=prompt, images=[i], return_tensors="pt")

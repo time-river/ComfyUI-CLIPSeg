@@ -1,0 +1,3 @@
+[submodule "clipseg-rd64-refined"]
+	path = clipseg-rd64-refined
+	url = https://huggingface.co/CIDAS/clipseg-rd64-refined
